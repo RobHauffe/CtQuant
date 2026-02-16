@@ -8,7 +8,7 @@ to use, copy, modify, and distribute the Software for academic, research, and ot
 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 Any modifications must be clearly indicated.
-Proper attribution must be given in any academic publication or presentation using this Software, including citation of the associated Zenodo DOI (10.5281/zenodo.18633021) where applicable.
+Proper attribution must be given in any academic publication or presentation using this Software, including citation of the associated Zenodo DOI (10.5281/zenodo.18657216) where applicable.
 
 2. Commercial Use
 
@@ -35,5 +35,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 4. Reservation of Rights
+
 
 All rights not expressly granted under this license are reserved by the copyright holder.
