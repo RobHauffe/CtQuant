@@ -1,8 +1,8 @@
-# CtQuant - qPCR Analysis Tool
+# CtQuant - qPCR Analysis & cDNA Synthesis Tool
 
-CtQuant is a powerful and intuitive tool for analyzing qPCR data using the ddCt (2^-ddCt) quantification method. It simplifies technical replicate averaging, dCt/ddCt calculations, and statistical comparisons.
+CtQuant is a comprehensive tool for molecular biology workflows, integrating cDNA synthesis planning with qPCR data analysis using the ddCt (2^-ddCt) quantification method.
 
-## Version 1.0.0
+## Version 1.2.0
 
 ## Citation
 
@@ -18,13 +18,43 @@ See the LICENSE file for details.
 **Author:** Dr. Robert Hauffe
 
 ## Features
-- **Flexible Mapping:** Visual plate mapper for 96-well and 384-well formats.
+
+### cDNA Synthesis Planning
+- **Automated Calculations:** Determine RNA and H2O volumes for reverse transcription based on concentration inputs.
+- **Dilution Logic:** Calculate post-synthesis dilution volumes to reach a target final cDNA concentration.
+- **Flexible Input:** Supports `.csv`, `.xls`, and `.xlsx` files from various spectrophotometers (e.g., NanoDrop).
+- **Pipetting Support:** Export pipetting schemes as PDF and Excel files.
+- **Workflow Integration:** Transfer defined sample groups directly to the Plate Mapper.
+
+### qPCR Analysis
+- **Flexible Mapping:** Visual plate mapper for 96-well and 384-well formats with "Paint" and "Erase" tools.
 - **Automated Calculations:** Technical replicate averaging, dCt, ddCt, and Fold Change.
 - **Statistical Analysis:** Built-in Student's t-test and Welch's t-test.
 - **Interactive Refinement:** Exclude biological replicates directly from results view.
 - **Comprehensive Export:** Export summary and detailed biological/technical replicate data to multi-sheet Excel files.
 
-## Methodology
+## Workflow
+
+### 1. cDNA Synthesis
+1.  **Load Data:** Import RNA concentration data (CSV/Excel). The tool automatically detects "Sample Name" and "Concentration" columns.
+2.  **Configure Parameters:**
+    *   **Rxn Vol pre-RTase (µL):** Volume available for RNA + H2O before adding the master mix.
+    *   **Total Synth Vol (µL):** Total volume of the cDNA synthesis reaction (e.g., 20 µL).
+    *   **Final cDNA Conc (ng/µL):** Desired concentration of cDNA after dilution.
+3.  **Review & Group:** The tool automatically maximizes RNA input (up to 1000 ng). Assign group names (e.g., "WT", "KO") for downstream analysis.
+4.  **Export:** Generate a pipetting scheme (PDF) or detailed Excel report.
+5.  **Transfer:** Click "Define Group Names" to transfer sample names to the Plate Mapper.
+
+### 2. qPCR Analysis
+1.  **Load Data:** Import raw Ct values from your qPCR instrument (Excel).
+2.  **Map Plate:**
+    *   **Samples:** Use the "Paint" tool to assign samples to wells. (Right-click to erase).
+    *   **Targets:** Assign Gene of Interest (GOI) and Housekeeping (HK) genes.
+3.  **Analyze:** Click "Calculate" to process data.
+4.  **Refine:** Review results, exclude outliers if necessary, and re-calculate.
+5.  **Export:** Save comprehensive results to Excel.
+
+## Methodology (qPCR)
 
 CtQuant processes raw Ct values through the following pipeline:
 
@@ -59,23 +89,25 @@ To build the standalone executable yourself, follow these steps:
 ### 1. Prerequisites
 Ensure you have Python installed. Then, install the required dependencies:
 ```bash
-pip install pandas numpy scipy PyQt6 pyinstaller
+pip install pandas numpy scipy PyQt6 pyinstaller openpyxl reportlab xlrd
 ```
 
 ### 2. Build the Executable
 Run the following command in the project root directory:
 ```bash
-pyinstaller --noconfirm --onefile --windowed --icon="CtQuant_icon.ico" --add-data "CtQuant_icon.ico;." --name "CtQuant" "CtQuant.py"
+pyinstaller --clean --noconfirm --onefile --windowed --name "CtQuant_v1.2.0" --icon="CtQuant_icon.ico" --add-data="CtQuant_icon.ico;." CtQuant.py
 ```
 The executable will be available in the `dist/` folder.
 
-## Executable Verification (v1.0.0)
-You can verify the integrity of the provided `CtQuant.exe` using the SHA-256 checksum:
+## Verification
 
-**SHA-256 Checksum:**
-`0D61E37A1171E9DD032FD39B87384C4ADCC8B9BB901DA9287A406C67CCB1AE42`
+To verify the integrity of the distributed executable (`CtQuant_v1.2.0.exe`), you can compare its SHA256 checksum with the following value:
 
-To check this on Windows:
+**SHA256 Checksum:**
+`BF395D33A10AA94DDD80933AEDBEA34E44A935C92FB55ED3CAE7F58D1D148623`
+
+You can verify this in PowerShell using:
 ```powershell
-Get-FileHash dist/CtQuant.exe -Algorithm SHA256
+Get-FileHash -Path "CtQuant_v1.2.0.exe" -Algorithm SHA256
 ```
+

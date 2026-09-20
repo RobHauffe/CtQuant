@@ -2,14 +2,26 @@ import os
 import sys
 import pandas as pd
 import numpy as np
+import math
+import csv
 from scipy import stats
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QTableWidget, QTableWidgetItem, QFileDialog, 
                              QTabWidget, QComboBox, QGroupBox, QGridLayout, QScrollArea,
                              QHeaderView, QMessageBox, QMenu, QDialog, QFormLayout, QCheckBox,
-                             QTreeWidget, QTreeWidgetItem, QToolButton)
-from PyQt6.QtCore import Qt, pyqtSignal, QRect, QSize
+                             QTreeWidget, QTreeWidgetItem, QToolButton, QInputDialog, QSplitter,
+                             QRadioButton, QButtonGroup, QDoubleSpinBox)
+from PyQt6.QtCore import Qt, pyqtSignal, QRect, QSize, QPoint
 from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QAction, QIcon
+
+# ReportLab imports for PDF generation
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.colors import HexColor, black
+    from reportlab.lib.units import mm
+except ImportError:
+    pass # Handle gracefully if missing, though we installed it
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -34,6 +46,7 @@ class WellButton(QWidget):
         self.gene_type = "None" # "Housekeeping", "GOI", "None"
         self.ct_value = None
         self.is_excluded = False
+        self.custom_color = None  # For specific GOI colors
         self.setFixedSize(30, 30)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents) # Let parent handle events
         
@@ -42,14 +55,15 @@ class WellButton(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
         # Color based on group type and gene type
-        # We'll use a gradient or a split color if both are defined?
-        # Let's use Gene Type for the main color and Group for the border or a small dot.
-        
         base_color = QColor(240, 240, 240)
+        
         if self.gene_type == 'Housekeeping':
             base_color = QColor(144, 238, 144) # LightGreen
         elif self.gene_type == 'GOI':
-            base_color = QColor(255, 255, 153) # LightYellow
+            if self.custom_color:
+                base_color = self.custom_color
+            else:
+                base_color = QColor(255, 255, 153) # Default LightYellow
             
         if self.selected:
             painter.setPen(QPen(Qt.GlobalColor.blue, 3))
@@ -81,7 +95,7 @@ class WellButton(QWidget):
 
 class HeaderButton(QLabel):
     """A clickable header for row/column selection."""
-    clicked = pyqtSignal(str, int) # type ('row' or 'col'), index
+    clicked = pyqtSignal(str, int, Qt.MouseButton) # type ('row' or 'col'), index, button
 
     def __init__(self, text, type, index, parent=None):
         super().__init__(text, parent)
@@ -92,20 +106,27 @@ class HeaderButton(QLabel):
         self.setFixedSize(30, 30)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self.type, self.index)
+        if event.button() == Qt.MouseButton.LeftButton or event.button() == Qt.MouseButton.RightButton:
+            self.clicked.emit(self.type, self.index, event.button())
 
 class PlateMapper(QWidget):
     """The grid component for mapping samples to wells."""
-    selection_changed = pyqtSignal()
+    data_changed = pyqtSignal()
 
     def __init__(self, rows=16, cols=24, parent=None):
         super().__init__(parent)
         self.rows = rows
         self.cols = cols
         self.wells = {} # (row, col) -> WellButton
-        self.is_dragging = False
-        self.drag_start_well = None
+        self.is_drawing = False
+        self.current_tool = "select" # 'paint', 'erase'
+        self.brush_data = {} 
+        self.gene_colors = {} 
+        self.color_palette = [
+            QColor(173, 216, 230), QColor(255, 182, 193), QColor(152, 251, 152), 
+            QColor(238, 232, 170), QColor(221, 160, 221), QColor(176, 224, 230),
+            QColor(255, 160, 122), QColor(240, 128, 128), QColor(255, 218, 185)
+        ]
         self.setMouseTracking(True)
         self.init_ui()
         
@@ -123,12 +144,12 @@ class PlateMapper(QWidget):
         
         for c in range(self.cols):
             btn = HeaderButton(str(c+1), 'col', c)
-            btn.clicked.connect(self.select_column)
+            btn.clicked.connect(self.handle_header_click)
             self.grid_layout.addWidget(btn, 0, c+1)
             
         for r in range(self.rows):
             btn = HeaderButton(chr(65+r), 'row', r)
-            btn.clicked.connect(self.select_row)
+            btn.clicked.connect(self.handle_header_click)
             self.grid_layout.addWidget(btn, r+1, 0)
             
         for r in range(self.rows):
@@ -137,169 +158,995 @@ class PlateMapper(QWidget):
                 self.grid_layout.addWidget(well, r+1, c+1)
                 self.wells[(r, c)] = well
 
-    def select_row(self, type, index):
-        # Check if all wells in the row are already selected
-        all_selected = all(self.wells[(index, c)].selected for c in range(self.cols))
-        
-        if not (QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier):
-            self.clear_selection(update=False)
-            
-        target_state = not all_selected
-        for c in range(self.cols):
-            self.wells[(index, c)].selected = target_state
-            self.wells[(index, c)].update()
-        self.selection_changed.emit()
-
-    def select_column(self, type, index):
-        # Check if all wells in the column are already selected
-        all_selected = all(self.wells[(r, index)].selected for r in range(self.rows))
-
-        if not (QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier):
-            self.clear_selection(update=False)
-            
-        target_state = not all_selected
-        for r in range(self.rows):
-            self.wells[(r, index)].selected = target_state
-            self.wells[(r, index)].update()
-        self.selection_changed.emit()
-
     def get_well_at(self, pos):
-        # Calculate row/col based on fixed size (30x30) + spacing (1)
-        # Headers are also 30x30
-        x = pos.x()
-        y = pos.y()
-        
-        # Grid starts at (0,0) but has headers
-        # Col 0 is row labels, Row 0 is col labels
-        c = (x // 31) - 1
-        r = (y // 31) - 1
-        
-        if 0 <= r < self.rows and 0 <= c < self.cols:
-            return self.wells.get((r, c))
+        # Iterate over wells to find which one contains the point
+        # This avoids issues with childAt and WA_TransparentForMouseEvents
+        for well in self.wells.values():
+            if well.geometry().contains(pos):
+                return well
         return None
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            well = self.get_well_at(event.position().toPoint())
-            if well:
-                self.is_dragging = True
-                self.drag_start_well = well
-                
-                modifiers = event.modifiers()
-                if modifiers & Qt.KeyboardModifier.ShiftModifier:
-                    # Select all to the left in this row
-                    for c in range(well.col + 1):
-                        self.wells[(well.row, c)].selected = True
-                        self.wells[(well.row, c)].update()
-                elif modifiers & Qt.KeyboardModifier.ControlModifier:
-                    well.selected = not well.selected
-                    well.update()
-                else:
-                    # If it's already selected and no other wells are selected, toggle it off
-                    selected_count = len(self.get_selected_wells())
-                    if well.selected and selected_count == 1:
-                        well.selected = False
-                    else:
-                        self.clear_selection(update=False)
-                        well.selected = True
-                    well.update()
-                
-                self.selection_changed.emit()
+    def set_brush_data(self, data):
+        if data:
+            self.brush_data = data
+            # Assign color if GOI
+            if data.get('gene_type') == 'GOI' and data.get('gene_name'):
+                gene = data['gene_name']
+                if gene not in self.gene_colors:
+                    idx = len(self.gene_colors) % len(self.color_palette)
+                    self.gene_colors[gene] = self.color_palette[idx]
+                self.brush_data['color'] = self.gene_colors[gene]
+            else:
+                self.brush_data['color'] = None
 
-    def mouseMoveEvent(self, event):
-        if self.is_dragging:
-            well = self.get_well_at(event.position().toPoint())
-            if well and well != self.drag_start_well:
-                self.select_range(self.drag_start_well, well)
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.is_dragging = False
-            self.selection_changed.emit()
-
-    def select_range(self, start_well, end_well):
-        r1, r2 = min(start_well.row, end_well.row), max(start_well.row, end_well.row)
-        c1, c2 = min(start_well.col, end_well.col), max(start_well.col, end_well.col)
-        
-        # If Ctrl is NOT held, we should probably only select the current range
-        # and clear others. But dragging usually implies extending selection.
-        # Let's match standard spreadsheet behavior.
-        
-        is_ctrl = QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier
-        
-        for r in range(self.rows):
-            for c in range(self.cols):
-                in_range = r1 <= r <= r2 and c1 <= c <= c2
-                if in_range:
-                    self.wells[(r, c)].selected = True
-                elif not is_ctrl:
-                    self.wells[(r, c)].selected = False
-                self.wells[(r, c)].update()
-
-    def clear_selection(self, update=True):
-        for well in self.wells.values():
-            well.selected = False
-            if update:
-                well.update()
-
-    def reset_all_wells(self):
-        """Clears all assignments and selections from all wells."""
-        for well in self.wells.values():
-            well.selected = False
+    def apply_brush(self, well, mode='paint'):
+        if mode == 'paint':
+            # Apply only if data is present
+            if 'sample_name' in self.brush_data: well.sample_name = self.brush_data['sample_name']
+            if 'gene_name' in self.brush_data: well.gene_name = self.brush_data['gene_name']
+            if 'group_type' in self.brush_data: well.group_type = self.brush_data['group_type']
+            if 'gene_type' in self.brush_data: well.gene_type = self.brush_data['gene_type']
+            if 'color' in self.brush_data: well.custom_color = self.brush_data['color']
+            well.update()
+            self.data_changed.emit()
+        elif mode == 'erase':
             well.sample_name = ""
             well.gene_name = ""
             well.group_type = "None"
             well.gene_type = "None"
-            # We might want to keep ct_value if it's from a loaded file, 
-            # but usually "Clear Plate" means start over.
+            well.custom_color = None
+            well.update()
+            self.data_changed.emit()
+
+    def handle_header_click(self, type, index, button):
+        mode = 'paint' if button == Qt.MouseButton.LeftButton else 'erase'
+        
+        if type == 'row':
+            for c in range(self.cols):
+                well = self.wells.get((index, c))
+                if well: self.apply_brush(well, mode)
+        elif type == 'col':
+            for r in range(self.rows):
+                well = self.wells.get((r, index))
+                if well: self.apply_brush(well, mode)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.current_tool = 'paint'
+        elif event.button() == Qt.MouseButton.RightButton:
+            self.current_tool = 'erase'
+        else:
+            return
+
+        well = self.get_well_at(event.position().toPoint())
+        # Start drawing if clicking on a well
+        if well:
+            self.is_drawing = True
+            self.apply_brush(well, self.current_tool)
+        else:
+            # If not clicking a well, assume box selection start
+            # But wait, what if the user clicks slightly outside?
+            # Let's enable box selection if not directly on a well.
+            self.is_drawing = True
+            self.selection_start = event.position().toPoint()
+            self.selection_end = self.selection_start
+            self.update() # trigger paintEvent for rubber band
+
+    def mouseMoveEvent(self, event):
+        if self.is_drawing:
+            if hasattr(self, 'selection_start'):
+                # Box selection mode
+                self.selection_end = event.position().toPoint()
+                self.update()
+            else:
+                # Continuous paint mode (drag over wells)
+                well = self.get_well_at(event.position().toPoint())
+                if well:
+                    self.apply_brush(well, self.current_tool)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton or event.button() == Qt.MouseButton.RightButton:
+            if hasattr(self, 'selection_start'):
+                # Apply to selection
+                rect = QRect(self.selection_start, self.selection_end).normalized()
+                for (r, c), well in self.wells.items():
+                    # Map well to parent coordinates
+                    well_pos = well.pos()
+                    # Include a small tolerance or use center point
+                    well_center = QPoint(well_pos.x() + well.width()//2, well_pos.y() + well.height()//2)
+                    
+                    if rect.contains(well_center):
+                        self.apply_brush(well, self.current_tool)
+                
+                delattr(self, 'selection_start')
+                delattr(self, 'selection_end')
+                self.update() # clear rubber band
+            
+            self.is_drawing = False
+
+    def paintEvent(self, event):
+        # Draw rubber band if selecting
+        if hasattr(self, 'selection_start') and hasattr(self, 'selection_end'):
+            painter = QPainter(self)
+            painter.setPen(QPen(Qt.GlobalColor.blue, 2, Qt.PenStyle.DashLine))
+            painter.setBrush(QBrush(QColor(0, 0, 255, 50)))
+            rect = QRect(self.selection_start, self.selection_end).normalized()
+            painter.drawRect(rect)
+
+    def reset_all_wells(self):
+        for well in self.wells.values():
+            well.sample_name = ""
+            well.gene_name = ""
+            well.group_type = "None"
+            well.gene_type = "None"
             well.ct_value = None
             well.is_excluded = False
+            well.custom_color = None
             well.update()
-        self.selection_changed.emit()
-            
-    def get_selected_wells(self):
-        return [pos for pos, well in self.wells.items() if well.selected]
+        self.data_changed.emit()
 
-    def assign_mapping(self, sample_name, gene_name, group_type, gene_type):
-        selected_positions = self.get_selected_wells()
-        for pos in selected_positions:
-            well = self.wells[pos]
-            if sample_name is not None: well.sample_name = sample_name
-            if gene_name is not None: well.gene_name = gene_name
-            if group_type is not None: well.group_type = group_type
-            if gene_type is not None: well.gene_type = gene_type
-            well.selected = False
-            well.update()
-        self.selection_changed.emit()
+    def export_pipetting_scheme(self):
+        """Export the plate layout to Excel or PDF."""
+        choice, _ = QInputDialog.getItem(self, "Export Pipetting Scheme", "Select Format:", ["Excel", "PDF"], 0, False)
+        if not choice: return
+
+        # Gather data
+        data = []
+        for (r, c), well in self.wells.items():
+            if well.sample_name or well.gene_name:
+                well_id = f"{chr(65+r)}{c+1}"
+                data.append({
+                    "Well": well_id,
+                    "Row": r,
+                    "Col": c,
+                    "Sample": well.sample_name,
+                    "Gene": well.gene_name,
+                    "Group": well.group_type,
+                    "Type": well.gene_type
+                })
+        
+        if not data:
+            QMessageBox.warning(self, "No Data", "Plate is empty.")
+            return
+
+        df = pd.DataFrame(data)
+        
+        if choice == "Excel":
+            path, _ = QFileDialog.getSaveFileName(self, "Save Pipetting Scheme", "Plate_Scheme.xlsx", "Excel Files (*.xlsx)")
+            if not path: return
+            try:
+                import openpyxl
+                from openpyxl.styles import PatternFill
+                
+                # Create workbook from scratch with openpyxl
+                wb = openpyxl.Workbook()
+                wb.remove(wb.active)  # Remove default sheet
+                
+                # Sheet 1: List view
+                ws_list = wb.create_sheet("List")
+                headers = list(df.columns)
+                for col_idx, header in enumerate(headers, start=1):
+                    ws_list.cell(row=1, column=col_idx, value=header)
+                
+                for row_idx, (_, row_data) in enumerate(df.iterrows(), start=2):
+                    for col_idx, header in enumerate(headers, start=1):
+                        ws_list.cell(row=row_idx, column=col_idx, value=row_data[header])
+                
+                # Sheet 2: Sample Grid
+                ws_sample = wb.create_sheet("Sample_Grid")
+                grid_sample = df.pivot(index='Row', columns='Col', values='Sample')
+                
+                # Write headers (columns)
+                for col_idx, col_name in enumerate(grid_sample.columns, start=2):
+                    ws_sample.cell(row=1, column=col_idx, value=col_name)
+                
+                # Write row indices and data
+                for row_idx, row_name in enumerate(grid_sample.index, start=2):
+                    ws_sample.cell(row=row_idx, column=1, value=row_name)
+                    for col_idx, col_name in enumerate(grid_sample.columns, start=2):
+                        value = grid_sample.loc[row_name, col_name]
+                        if pd.notna(value):
+                            ws_sample.cell(row=row_idx, column=col_idx, value=value)
+                
+                # Sheet 3: Gene Grid
+                ws_gene = wb.create_sheet("Gene_Grid")
+                grid_gene = df.pivot(index='Row', columns='Col', values='Gene')
+                
+                # Write headers (columns)
+                for col_idx, col_name in enumerate(grid_gene.columns, start=2):
+                    ws_gene.cell(row=1, column=col_idx, value=col_name)
+                
+                # Write row indices and data
+                for row_idx, row_name in enumerate(grid_gene.index, start=2):
+                    ws_gene.cell(row=row_idx, column=1, value=row_name)
+                    for col_idx, col_name in enumerate(grid_gene.columns, start=2):
+                        value = grid_gene.loc[row_name, col_name]
+                        if pd.notna(value):
+                            ws_gene.cell(row=row_idx, column=col_idx, value=value)
+                
+                # Apply colors to Gene Grid based on GOI colors
+                for r in range(self.rows):
+                    for c in range(self.cols):
+                        well = self.wells.get((r, c))
+                        if well and well.custom_color:
+                            color_hex = well.custom_color.name().lstrip('#')
+                            fill = PatternFill(start_color=color_hex, end_color=color_hex, fill_type='solid')
+                            # +2 because 1-based index and header row/col
+                            ws_gene.cell(row=r+2, column=c+2).fill = fill
+                
+                wb.save(path)
+                os.startfile(path)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to export Excel: {e}")
+
+        elif choice == "PDF":
+            path, _ = QFileDialog.getSaveFileName(self, "Save Pipetting Scheme", "Plate_Scheme.pdf", "PDF Files (*.pdf)")
+            if not path: return
+            try:
+                c = canvas.Canvas(path, pagesize=A4)
+                width, height = A4
+                c.setFont("Helvetica-Bold", 14)
+                c.drawString(20*mm, height-20*mm, "Pipetting Scheme")
+                
+                # Draw Grid
+                x_start = 20*mm
+                y_start = height - 40*mm
+                cell_w = 180*mm / self.cols if self.cols <= 12 else 280*mm / self.cols # Adjust for plate size
+                if self.cols > 12: 
+                    c.setPageSize((297*mm, 210*mm)) # Landscape for 384 well
+                    width, height = (297*mm, 210*mm)
+                    cell_w = 260*mm / self.cols
+                    x_start = 10*mm
+                    y_start = height - 30*mm
+                
+                cell_h = cell_w * 0.8
+                
+                c.setFont("Helvetica", 6 if self.cols > 12 else 8)
+                
+                for r in range(self.rows):
+                    for c_idx in range(self.cols):
+                        well = self.wells.get((r, c_idx))
+                        x = x_start + c_idx * cell_w
+                        y = y_start - r * cell_h
+                        
+                        # Fill
+                        if well and well.custom_color:
+                            c.setFillColor(HexColor(well.custom_color.name()))
+                            c.rect(x, y - cell_h, cell_w, cell_h, fill=1, stroke=1)
+                            c.setFillColor(black)
+                        else:
+                            c.rect(x, y - cell_h, cell_w, cell_h, fill=0, stroke=1)
+                            
+                        # Text
+                        if well:
+                            txt = ""
+                            if well.sample_name: txt += well.sample_name[:4] + "\n"
+                            if well.gene_name: txt += well.gene_name[:4]
+                            
+                            lines = txt.split('\n')
+                            ty = y - cell_h/2 + (len(lines)*2)
+                            for line in lines:
+                                c.drawCentredString(x + cell_w/2, ty, line)
+                                ty -= 8 if self.cols <= 12 else 6
+
+                # Legend
+                y = y_start - self.rows * cell_h - 20*mm
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(x_start, y, "Gene Legend:")
+                y -= 10*mm
+                c.setFont("Helvetica", 10)
+                
+                for gene, color in self.gene_colors.items():
+                    c.setFillColor(HexColor(color.name()))
+                    c.rect(x_start, y, 5*mm, 5*mm, fill=1, stroke=1)
+                    c.setFillColor(black)
+                    c.drawString(x_start + 8*mm, y, gene)
+                    y -= 8*mm
+                    if y < 20*mm:
+                        c.showPage()
+                        y = height - 20*mm
+
+                c.save()
+                os.startfile(path)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to export PDF: {e}")
+
+class cDNA_Tab(QWidget):
+    """Tab for cDNA calculation and planning."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.amount_colors = {
+            1000: "#a5d6a7", 900: "#c8e6c9", 800: "#dcedc8", 700: "#e8f5e9",
+            600: "#fff59d", 500: "#fff9c4", 400: "#fffde7",
+            300: "#ffcc80", 200: "#ffe0b2", 100: "#fff3e0",
+            "low": "#ffcdd2"
+        }
+        self.df_data = pd.DataFrame()
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Top: Load Button
+        top_layout = QHBoxLayout()
+        self.load_btn = QPushButton("Load RNA Concentrations (Excel/CSV)")
+        self.load_btn.clicked.connect(self.load_data)
+        self.load_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db;
+                color: white;
+                font-weight: bold;
+                font-size: 14px;
+                border-radius: 5px;
+                padding: 5px 20px;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+        """)
+        top_layout.addWidget(self.load_btn)
+        top_layout.addStretch()
+        layout.addLayout(top_layout)
+        
+        # Main Content: Table (Left) + Controls (Right)
+        main_content = QHBoxLayout()
+        
+        # Table Area (Left)
+        table_area = QVBoxLayout()
+        
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Sample Name", "RNA Conc. (ng/µL)", "µL RNA", "ng RNA", "µL H2O", "Dilution Vol (µL)"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table_area.addWidget(self.table)
+        
+        # Legend
+        legend_layout = QHBoxLayout()
+        legend_layout.setSpacing(0)
+        
+        legend_items = [
+            ("1000 ng", "#2E7D32"), ("900 ng", "#43A047"), ("800 ng", "#66BB6A"), ("700 ng", "#A5D6A7"),
+            ("600 ng", "#FFF176"), ("500 ng", "#FFD54F"), ("400 ng", "#FFB74D"), ("300 ng", "#FF9800"),
+            ("200 ng", "#F57C00"), ("100 ng", "#FF7043"), ("<100 ng (N/A)", "#B71C1C")
+        ]
+        
+        for label_text, color_hex in legend_items:
+            lbl = QLabel(label_text)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet(f"background-color: {color_hex}; border: 1px solid #ddd; padding: 2px;")
+            if color_hex in ["#2E7D32", "#43A047", "#F57C00", "#FF9800", "#B71C1C", "#FF7043"]: # Darker backgrounds
+                 lbl.setStyleSheet(f"background-color: {color_hex}; color: white; border: 1px solid #ddd; padding: 2px;")
+            legend_layout.addWidget(lbl)
+            
+        table_area.addLayout(legend_layout)
+        
+        main_content.addLayout(table_area, 3) # Stretch factor 3
+        
+        # Right Side Controls
+        controls_panel = QVBoxLayout()
+        controls_panel.setAlignment(Qt.AlignmentFlag.AlignTop)
+        
+        # Target RNA Amount - REMOVED
+        
+        # Rxn volume pre-RTase Mix
+        self.pre_rt_vol_input = QDoubleSpinBox()
+        self.pre_rt_vol_input.setPrefix("Rxn Vol pre-RTase: ")
+        self.pre_rt_vol_input.setSuffix(" µL")
+        self.pre_rt_vol_input.setRange(1, 100)
+        self.pre_rt_vol_input.setValue(15)
+        self.pre_rt_vol_input.setDecimals(1)
+        self.pre_rt_vol_input.valueChanged.connect(self.calculate_volumes_if_loaded)
+        controls_panel.addWidget(self.pre_rt_vol_input)
+        
+        # Total Synthesis Volume (Hidden/Standard input for calc)
+        self.synth_vol_input = QDoubleSpinBox()
+        self.synth_vol_input.setPrefix("Total Synth Vol: ")
+        self.synth_vol_input.setSuffix(" µL")
+        self.synth_vol_input.setRange(1, 100)
+        self.synth_vol_input.setValue(20)
+        self.synth_vol_input.setDecimals(1)
+        self.synth_vol_input.valueChanged.connect(self.calculate_volumes_if_loaded)
+        controls_panel.addWidget(self.synth_vol_input)
+        
+        # Final cDNA Conc
+        self.final_conc_input = QDoubleSpinBox()
+        self.final_conc_input.setPrefix("Final cDNA Conc: ")
+        self.final_conc_input.setSuffix(" ng/µL")
+        self.final_conc_input.setRange(0.1, 1000)
+        self.final_conc_input.setValue(5)
+        self.final_conc_input.setDecimals(1)
+        self.final_conc_input.valueChanged.connect(self.calculate_volumes_if_loaded)
+        controls_panel.addWidget(self.final_conc_input)
+        
+        controls_panel.addSpacing(20)
+        
+        # Group Assignment
+        self.assign_group_btn = QPushButton("Define Group Names")
+        self.assign_group_btn.clicked.connect(self.define_groups)
+        self.assign_group_btn.setEnabled(False)
+        self.assign_group_btn.setStyleSheet("background-color: #dcedc8; color: black; font-weight: bold;")
+        controls_panel.addWidget(self.assign_group_btn)
+        
+        controls_panel.addSpacing(10)
+        
+        self.export_excel_btn = QPushButton("Export Excel")
+        self.export_excel_btn.clicked.connect(self.export_excel)
+        self.export_excel_btn.setEnabled(False)
+        controls_panel.addWidget(self.export_excel_btn)
+        
+        self.export_pdf_btn = QPushButton("Export Pipetting PDF")
+        self.export_pdf_btn.clicked.connect(self.export_pdf)
+        self.export_pdf_btn.setEnabled(False)
+        controls_panel.addWidget(self.export_pdf_btn)
+        
+        controls_panel.addStretch()
+        
+        main_content.addLayout(controls_panel, 1) # Stretch factor 1
+        layout.addLayout(main_content)
+
+        # Footer Note
+        footer_label = QLabel("To each reaction add amount of RTase, buffer, primer, and dNTPs as per the manufacturer's instructions.")
+        footer_label.setStyleSheet("font-style: italic; color: #555;")
+        footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(footer_label)
+
+    def calculate_volumes_if_loaded(self):
+        if not self.df_data.empty:
+            self.calculate_volumes()
+            self.update_table()
+
+    def load_data(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open Concentration File", "", "Data Files (*.xlsx *.xls *.csv);;All Files (*)")
+        if not file_path:
+            return
+
+        # Update status message in main window
+        parent = self.parent()
+        while parent and not hasattr(parent, 'set_status_message'):
+            parent = parent.parent()
+        if parent:
+            parent.set_status_message(f"Loaded: {os.path.basename(file_path)}")
+
+        try:
+            if file_path.lower().endswith('.csv'):
+                # Try UTF-8 first
+                try:
+                    df_raw = pd.read_csv(file_path, encoding='utf-8', sep=None, engine='python', header=None)
+                except UnicodeDecodeError:
+                    # Try UTF-16 next
+                    try:
+                        df_raw = pd.read_csv(file_path, encoding='utf-16', sep=None, engine='python', header=None)
+                    except UnicodeDecodeError:
+                        # Finally try latin1
+                        df_raw = pd.read_csv(file_path, encoding='latin1', sep=None, engine='python', header=None)
+            else:
+                df_raw = pd.read_excel(file_path, header=None)
+            
+            # Robust Header Detection
+            header_row_idx = 0
+            found_header = False
+            
+            # Search for header in first 50 rows
+            for i in range(min(50, len(df_raw))):
+                row_vals = [str(x).lower() for x in df_raw.iloc[i]]
+                
+                # Check for key columns
+                has_name = any("sample" in x or "name" in x or "content" in x for x in row_vals)
+                has_conc = any("conc" in x or "ng/ul" in x or "ng/µl" in x or "nucleic acid" in x for x in row_vals)
+                
+                if has_name and has_conc:
+                    header_row_idx = i
+                    found_header = True
+                    break
+            
+            # Apply header
+            if found_header:
+                df = df_raw.iloc[header_row_idx+1:].copy()
+                df.columns = df_raw.iloc[header_row_idx]
+            else:
+                # Fallback: assume first row is header if not found
+                if len(df_raw) > 0:
+                    df = df_raw.iloc[1:].copy()
+                    df.columns = df_raw.iloc[0]
+                else:
+                    df = df_raw # Empty
+
+            # Smart column detection
+            name_col = None
+            conc_col = None
+            
+            # normalize cols to lower
+            cols_lower = [str(c).lower() for c in df.columns]
+            
+            # Find Name column
+            for i, c in enumerate(cols_lower):
+                if "sample" in c or "name" in c or "content" in c:
+                    name_col = df.columns[i]
+                    break
+            
+            # Find Concentration column
+            for i, c in enumerate(cols_lower):
+                if "conc" in c or "ng/ul" in c or "ng/µl" in c or "nucleic acid" in c:
+                    conc_col = df.columns[i]
+                    break
+            
+            # Fallback logic if smart detection fails
+            if name_col is None:
+                # If we have at least 1 col, take the first one
+                if df.shape[1] > 0:
+                    name_col = df.columns[0]
+                    # But wait, if column 0 is "Date", maybe we should skip it?
+                    if "date" in str(name_col).lower() and df.shape[1] > 1:
+                         name_col = df.columns[1]
+
+            if conc_col is None:
+                # If name_col was 0, take 1. If name_col was 1, take 2?
+                # Let's just try to find the next available column
+                if name_col == df.columns[0] and df.shape[1] > 1:
+                    conc_col = df.columns[1]
+                elif name_col == df.columns[1] and df.shape[1] > 2:
+                    conc_col = df.columns[2]
+                elif df.shape[1] > 1:
+                    conc_col = df.columns[1]
+
+            if name_col is None or conc_col is None:
+                QMessageBox.warning(self, "Error", f"Could not identify Name and Concentration columns.\nColumns found: {list(df.columns)}")
+                return
+
+            # Normalize data
+            try:
+                self.df_data = pd.DataFrame({
+                    'Sample Name': df[name_col].astype(str),
+                    'Concentration': pd.to_numeric(df[conc_col], errors='coerce'),
+                    'Group': [''] * len(df)
+                })
+            except Exception as e:
+                # print(f"Error normalizing data: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to parse columns: {e}")
+                return
+            
+            # Drop NaN concentrations
+            before_drop = len(self.df_data)
+            self.df_data.dropna(subset=['Concentration'], inplace=True)
+            # print(f"Rows before dropna: {before_drop}, after: {len(self.df_data)}")
+            
+            # Reset index
+            self.df_data.reset_index(drop=True, inplace=True)
+            
+            self.calculate_volumes()
+            self.update_table()
+            self.export_excel_btn.setEnabled(True)
+            self.export_pdf_btn.setEnabled(True)
+            self.assign_group_btn.setEnabled(True)
+
+        except Exception as e:
+            # print(f"Exception in load_data: {e}")
+            # import traceback
+            # traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Failed to load file: {e}")
+
+    def calculate_volumes(self):
+        # print("Calculating volumes...")
+        # Calculation Logic
+        pre_rt_vol = self.pre_rt_vol_input.value()
+        synth_vol = self.synth_vol_input.value()
+        final_conc = self.final_conc_input.value()
+        
+        # print(f"Inputs: Target={target_rna_ng}, PreRT={pre_rt_vol}, Synth={synth_vol}, Final={final_conc}")
+        
+        results = []
+        for idx, row in self.df_data.iterrows():
+            conc = row['Concentration']
+            if conc <= 0:
+                # print(f"Skipping row {idx}: Conc <= 0 ({conc})")
+                continue
+            
+            # 1. Determine optimal RNA amount (start 1000 ng, step down 100 ng)
+            optimal_rna_ng = 0
+            vol_rna = 0
+            
+            # Try from 1000 down to 100
+            for amount in range(1000, 99, -100):
+                v = amount / conc
+                if v <= pre_rt_vol:
+                    optimal_rna_ng = amount
+                    vol_rna = v
+                    break
+            
+            # If still 0, it means even 100 ng requires > pre_rt_vol
+            # Mark as "Too Low" (<100)
+            if optimal_rna_ng == 0:
+                # Use max possible volume to get max possible amount
+                vol_rna = pre_rt_vol
+                optimal_rna_ng = pre_rt_vol * conc
+                # Flag this? For now, we store the actual amount, but we'll color code it red
+            
+            # 2. Calc H2O Volume
+            if optimal_rna_ng < 100:
+                vol_h2o = "N/A"
+            elif vol_rna > pre_rt_vol:
+                # Should only happen if "Too Low" logic kicked in or conc very low
+                vol_rna = pre_rt_vol
+                vol_h2o = 0
+            else:
+                vol_h2o = round(pre_rt_vol - vol_rna, 2)
+            
+            # 3. Calc Dilution
+            # Total Volume Needed = Amount RNA Used / Final Conc
+            # Use optimal_rna_ng for this calculation
+            if optimal_rna_ng < 100:
+                dilution_vol = "N/A"
+            else:
+                total_final_vol = optimal_rna_ng / final_conc
+                
+                dilution_vol = total_final_vol - synth_vol
+                if dilution_vol < 0: dilution_vol = 0
+                dilution_vol = round(dilution_vol, 1)
+            
+            results.append({
+                'vol_rna': round(vol_rna, 2),
+                'ng_rna': round(optimal_rna_ng, 1),
+                'vol_h2o': vol_h2o,
+                'dilution_vol': dilution_vol,
+                'color': self.get_color_for_amount(optimal_rna_ng).name()
+            })
+            
+        # print(f"Calculated {len(results)} results")
+        
+        if len(results) > 0:
+            self.df_data['vol_rna'] = [r['vol_rna'] for r in results]
+            self.df_data['ng_rna'] = [r['ng_rna'] for r in results]
+            self.df_data['vol_h2o'] = [r['vol_h2o'] for r in results]
+            self.df_data['dilution_vol'] = [r['dilution_vol'] for r in results]
+            self.df_data['color'] = [r['color'] for r in results]
+        else:
+             # Handle empty results if needed, but columns should exist
+             self.df_data['vol_rna'] = []
+             self.df_data['ng_rna'] = []
+             self.df_data['vol_h2o'] = []
+             self.df_data['dilution_vol'] = []
+             self.df_data['color'] = []
+
+    def get_color_for_amount(self, amount):
+        if amount >= 1000: return QColor("#2E7D32") # Dark Green
+        if amount >= 900: return QColor("#43A047")
+        if amount >= 800: return QColor("#66BB6A")
+        if amount >= 700: return QColor("#A5D6A7") # Light Green
+        if amount >= 600: return QColor("#FFF176") # Yellow
+        if amount >= 500: return QColor("#FFD54F")
+        if amount >= 400: return QColor("#FFB74D")
+        if amount >= 300: return QColor("#FF9800")
+        if amount >= 200: return QColor("#F57C00")
+        if amount >= 100: return QColor("#FF7043") # Deep Orange (Lighter Red-ish)
+        return QColor("#B71C1C") # Dark Red (<100)
+
+    def update_table(self):
+        # print(f"Updating table with {len(self.df_data)} rows")
+        self.table.setRowCount(len(self.df_data))
+        for r, row in self.df_data.iterrows():
+            name = str(row['Sample Name'])
+            if row['Group']:
+                 name = str(row['Group']) # Use Group name if assigned
+                 
+            self.table.setItem(r, 0, QTableWidgetItem(name))
+            self.table.setItem(r, 1, QTableWidgetItem(str(row['Concentration'])))
+            self.table.setItem(r, 2, QTableWidgetItem(str(row['vol_rna'])))
+            
+            # ng RNA item with color
+            ng_item = QTableWidgetItem(str(row['ng_rna']))
+            color = self.get_color_for_amount(row['ng_rna'])
+            ng_item.setBackground(QBrush(color))
+            # Set text color to black or white for contrast? Default black usually works for pastels, 
+            # but for dark green/orange maybe white? Let's stick to black for now or simple check.
+            if row['ng_rna'] >= 900 or row['ng_rna'] <= 300:
+                 ng_item.setForeground(QBrush(Qt.GlobalColor.white))
+            else:
+                 ng_item.setForeground(QBrush(Qt.GlobalColor.black))
+                 
+            self.table.setItem(r, 3, ng_item)
+            
+            self.table.setItem(r, 4, QTableWidgetItem(str(row['vol_h2o'])))
+            self.table.setItem(r, 5, QTableWidgetItem(str(row['dilution_vol'])))
+            
+    def define_groups(self):
+        rows = sorted(set(index.row() for index in self.table.selectedIndexes()))
+        if not rows:
+            QMessageBox.warning(self, "Warning", "Please select rows to assign a group.")
+            return
+            
+        name, ok = QInputDialog.getText(self, "Group Name", "Enter Group Name (e.g. 'WT'):")
+        if ok and name:
+            # Assign names with increment
+            count = 1
+            for r in rows:
+                group_name = f"{name} {count}"
+                self.df_data.at[r, 'Group'] = group_name
+                # Update Sample Name in table
+                self.table.setItem(r, 0, QTableWidgetItem(group_name))
+                count += 1
+
+    def export_excel(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Excel", "cDNA_Scheme.xlsx", "Excel Files (*.xlsx)")
+        if not path: return
+        
+        try:
+            import openpyxl
+            from openpyxl.styles import PatternFill, Font, Alignment
+            
+            # Create a new workbook from scratch using openpyxl
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            
+            # Add Summary Information
+            summary_font = Font(bold=True)
+            
+            ws.cell(row=1, column=1, value="User Input Parameters").font = summary_font
+            
+            ws.cell(row=2, column=1, value="Rxn Vol (µL):")
+            ws.cell(row=2, column=2, value=self.pre_rt_vol_input.value())
+            
+            ws.cell(row=3, column=1, value="Total Synth Vol (µL):")
+            ws.cell(row=3, column=2, value=self.synth_vol_input.value())
+            
+            ws.cell(row=4, column=1, value="Final cDNA Conc (ng/µL):")
+            ws.cell(row=4, column=2, value=self.final_conc_input.value())
+            
+            # Column headers for the data table (Row 5)
+            headers = ["Sample Name", "RNA Conc. (ng/µL)", "µL RNA", "ng RNA", "µL H2O", "Dilution Vol (µL)"]
+            header_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
+            header_font = Font(bold=True)
+            center_align = Alignment(horizontal='center', vertical='center')
+            
+            for col_idx, header_text in enumerate(headers, start=1):
+                cell = ws.cell(row=5, column=col_idx, value=header_text)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = center_align
+            
+            # Add data rows starting at row 6
+            for r_idx, (_, row) in enumerate(self.df_data.iterrows(), start=6):
+                name = str(row['Sample Name'])
+                if row['Group']:
+                    name = str(row['Group'])
+                
+                # Get the color for this row
+                color_hex = str(row['color']).lstrip('#')
+                fill = PatternFill(start_color=color_hex, end_color=color_hex, fill_type='solid') if len(color_hex) == 6 else None
+                
+                # Write data and apply color
+                ws.cell(row=r_idx, column=1, value=name)
+                ws.cell(row=r_idx, column=2, value=row['Concentration'])
+                ws.cell(row=r_idx, column=3, value=row['vol_rna'])
+                ws.cell(row=r_idx, column=4, value=row['ng_rna'])
+                ws.cell(row=r_idx, column=5, value=row['vol_h2o'])
+                ws.cell(row=r_idx, column=6, value=row['dilution_vol'])
+                
+                # Apply color fill to all columns in this row
+                if fill:
+                    for c in range(1, len(headers) + 1):
+                        ws.cell(row=r_idx, column=c).fill = fill
+            
+            # Auto-adjust column widths
+            for column_cells in ws.columns:
+                max_length = 0
+                column = column_cells[0].column_letter
+                for cell in column_cells:
+                    try:
+                        val = cell.value
+                        if val:
+                            val_len = len(str(val))
+                            if val_len > max_length:
+                                max_length = val_len
+                    except:
+                        pass
+                
+                # Add extra padding for bold text and readability
+                adjusted_width = (max_length + 4)
+                ws.column_dimensions[column].width = adjusted_width
+
+            # Footer Note
+            last_row = len(self.df_data) + 6
+            ws.cell(row=last_row+2, column=1, value="To each reaction add amount of RTase, buffer, primer, and dNTPs as per the manufacturer's instructions.")
+            ws.cell(row=last_row+2, column=1).font = Font(italic=True, color="555555")
+
+            wb.save(path)
+            
+            # Prompt for transfer
+            reply = QMessageBox.question(self, "Transfer Samples", 
+                                         "Do you want to transfer these Group names to the Plate Mapper?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                groups = [g for g in self.df_data['Group'] if g]
+                if groups:
+                    # Clean group names (remove trailing numbers)
+                    import re
+                    clean_groups = []
+                    for g in groups:
+                        # Remove trailing space and digits (e.g., "WT 1" -> "WT")
+                        base_name = re.sub(r'\s+\d+$', '', str(g))
+                        if base_name and base_name not in clean_groups:
+                            clean_groups.append(base_name)
+                    
+                    # Find main window
+                    parent = self.parent()
+                    while parent and not isinstance(parent, QMainWindow):
+                        parent = parent.parent()
+                    
+                    if parent and hasattr(parent, 'transfer_samples_from_cdna'):
+                        parent.transfer_samples_from_cdna(clean_groups)
+            
+            os.startfile(path)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export: {e}")
+
+    def export_pdf(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save PDF", "Pipetting_Scheme.pdf", "PDF Files (*.pdf)")
+        if not path: return
+        
+        try:
+            c = canvas.Canvas(path, pagesize=A4)
+            width, height = A4
+            
+            # Title
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(20 * mm, height - 20 * mm, "cDNA Synthesis Pipetting Scheme")
+            
+            # Summary Information
+            c.setFont("Helvetica", 10)
+            y_summary = height - 35 * mm
+            c.drawString(20 * mm, y_summary, f"Rxn Vol: {self.pre_rt_vol_input.value()} µL")
+            c.drawString(70 * mm, y_summary, f"Total Synth Vol: {self.synth_vol_input.value()} µL")
+            c.drawString(120 * mm, y_summary, f"Final cDNA: {self.final_conc_input.value()} ng/µL")
+            
+            y = height - 50 * mm
+            
+            # Headers
+            # App Headers: ["Sample Name", "RNA Conc. (ng/µL)", "µL RNA", "ng RNA", "µL H2O", "Dilution Vol (µL)"]
+            headers = ["Sample Name", "RNA Conc.", "µL RNA", "ng RNA", "µL H2O", "Dil. Vol (µL)"]
+            # Shortened slightly for PDF fit, but kept key info. 
+            # "RNA Conc. (ng/µL)" -> "RNA Conc." (units implied or fit issue)
+            # "Dilution Vol (µL)" -> "Dil. Vol (µL)"
+            
+            # Adjust x positions for 6 columns
+            # Available width ~170mm (20 to 190)
+            # Sample: 20, Conc: 60, VolRNA: 85, ngRNA: 110, H2O: 135, Dil: 160
+            x_positions = [20, 60, 85, 110, 135, 160] 
+            
+            c.setFont("Helvetica-Bold", 9) # Reduced font size for headers to fit
+            for i, h in enumerate(headers):
+                c.drawString(x_positions[i] * mm, y, h)
+                
+            y -= 8 * mm
+            c.setFont("Helvetica", 10)
+            
+            for _, row in self.df_data.iterrows():
+                if y < 20 * mm:
+                    c.showPage()
+                    y = height - 20 * mm
+                    # Redraw headers on new page? Optional, but good practice.
+                    # For simplicity, we just continue data.
+                
+                # Determine Sample Name (Group or Original)
+                name = str(row['Sample Name'])
+                if row['Group']:
+                    name = str(row['Group'])
+
+                # Draw color rect
+                color_val = str(row['color'])
+                if color_val.startswith('#'):
+                    bg_color = HexColor(color_val)
+                else:
+                    bg_color = HexColor('#ffffff')
+                    
+                c.setFillColor(bg_color)
+                # Draw rect spanning all columns
+                c.rect(15 * mm, y - 2 * mm, 180 * mm, 6 * mm, fill=1, stroke=0)
+                
+                # Determine text color for contrast
+                text_color = black
+                dark_colors = ["#2E7D32", "#43A047", "#F57C00", "#FF9800", "#B71C1C", "#FF7043"]
+                if str(row['color']).upper() in dark_colors:
+                     text_color = HexColor('#FFFFFF')
+                
+                c.setFillColor(text_color)
+                
+                # Draw row data
+                c.drawString(x_positions[0] * mm, y, name[:20])
+                c.drawString(x_positions[1] * mm, y, str(row['Concentration']))
+                c.drawString(x_positions[2] * mm, y, str(row['vol_rna']))
+                c.drawString(x_positions[3] * mm, y, str(row['ng_rna']))
+                c.drawString(x_positions[4] * mm, y, str(row['vol_h2o']))
+                c.drawString(x_positions[5] * mm, y, str(row['dilution_vol']))
+                
+                y -= 8 * mm
+            
+            # Footer Note
+            y -= 5 * mm
+            if y < 20 * mm:
+                c.showPage()
+                y = height - 20 * mm
+            
+            c.setFont("Helvetica-Oblique", 9)
+            c.setFillColor(HexColor('#555555'))
+            c.drawString(20 * mm, y, "To each reaction add amount of RTase, buffer, primer, and dNTPs as per the manufacturer's instructions.")
+                
+            c.save()
+            
+            # Prompt for transfer
+            reply = QMessageBox.question(self, "Transfer Samples", 
+                                         "Do you want to transfer these Group names to the Plate Mapper?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                groups = [g for g in self.df_data['Group'] if g]
+                if groups:
+                    # Clean group names (remove trailing numbers)
+                    import re
+                    clean_groups = []
+                    for g in groups:
+                        # Remove trailing space and digits (e.g., "WT 1" -> "WT")
+                        base_name = re.sub(r'\s+\d+$', '', str(g))
+                        if base_name and base_name not in clean_groups:
+                            clean_groups.append(base_name)
+                    
+                    # Find main window
+                    parent = self.parent()
+                    while parent and not isinstance(parent, QMainWindow):
+                        parent = parent.parent()
+                    
+                    if parent and hasattr(parent, 'transfer_samples_from_cdna'):
+                        parent.transfer_samples_from_cdna(clean_groups)
+
+            os.startfile(path)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export PDF: {e}")
 
 class AboutWindow(QDialog):
     """The 'About CtQuant' window."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("About CtQuant")
-        self.setFixedSize(550, 450)
+        self.setFixedSize(600, 500)
         
         # Define attributes used in the UI
-        self.version = "v1.0.0"
+        self.version = "v1.2.0"
         self.creation_date = "2026"
         self.author = "Dr. Robert Hauffe"
         
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
         
-        # Get Started Tab
-        get_started = QWidget()
-        gs_layout = QVBoxLayout(get_started)
-        gs_text = QLabel("<b>Workflow Overview:</b><br><br>"
-                         "1. <b>Load Excel:</b> Select your raw qPCR data (e.g., Bio-Rad CFX export).<br>"
-                         "2. <b>Map Plate:</b> Select wells in the grid and assign them to Sample Groups and Genes.<br>"
-                         "3. <b>Configure Replicates:</b> Set the number of technical replicates and their layout.<br>"
-                         "4. <b>Run Analysis:</b> Processes the data using the ddCt method.<br>"
-                         "5. <b>Refine:</b> Right-click any row in the Analysis tab to exclude outliers.<br>"
-                         "6. <b>Export:</b> Save your results to a multi-sheet Excel file.")
-        gs_text.setWordWrap(True)
-        gs_layout.addWidget(gs_text)
-        tabs.addTab(get_started, "Get Started")
+        # cDNA Workflow Tab
+        cdna_tab = QWidget()
+        cdna_layout = QVBoxLayout(cdna_tab)
+        cdna_text = QLabel("<b>cDNA Synthesis Workflow:</b><br><br>"
+                           "1. <b>Load Data:</b> Import RNA concentration data (CSV/Excel). The tool detects 'Sample Name' and 'Concentration' columns.<br>"
+                           "2. <b>Configure:</b> Set Rxn Vol pre-RTase (µL), Total Synth Vol (µL), and Final cDNA Conc (ng/µL).<br>"
+                           "3. <b>Review:</b> The table updates automatically, maximizing RNA input (up to 1000 ng).<br>"
+                           "4. <b>Define Groups:</b> Assign group names (e.g., 'WT', 'KO') to samples.<br>"
+                           "5. <b>Export:</b> Generate a pipetting scheme (PDF) or Excel report.<br>"
+                           "6. <b>Transfer:</b> Click 'Define Group Names' to transfer samples to the Plate Mapper.")
+        cdna_text.setWordWrap(True)
+        cdna_layout.addWidget(cdna_text)
+        cdna_layout.addStretch()
+        tabs.addTab(cdna_tab, "cDNA Workflow")
+
+        # qPCR Workflow Tab
+        qpcr_tab = QWidget()
+        qpcr_layout = QVBoxLayout(qpcr_tab)
+        qpcr_text = QLabel("<b>qPCR Analysis Workflow:</b><br><br>"
+                         "1. <b>Load qPCR Data:</b> Import raw Ct values from your instrument (Excel).<br>"
+                         "2. <b>Map Plate:</b> Use the 'Paint' tool to assign samples (transferred from cDNA or manual) and targets (GOI/HK) to wells.<br>"
+                         "3. <b>Analyze:</b> Click 'Calculate' to process data using the ddCt method.<br>"
+                         "4. <b>Refine:</b> Review results in the Analysis tab. Right-click to exclude outliers.<br>"
+                         "5. <b>Export:</b> Save comprehensive results to Excel.")
+        qpcr_text.setWordWrap(True)
+        qpcr_layout.addWidget(qpcr_text)
+        qpcr_layout.addStretch()
+        tabs.addTab(qpcr_tab, "qPCR Workflow")
         
         # Methodology Tab
         methodology = QWidget()
@@ -310,13 +1157,13 @@ class AboutWindow(QDialog):
                         "• <b>ddCt:</b> dCt(Sample) - Average dCt(Control Group for that Gene).<br>"
                         "• <b>Fold Change:</b> 2<sup>-ddCt</sup>.<br>"
                         "• <b>% Change:</b> (Fold Change - 1) * 100.<br><br>"
-                        "<b>Statistics:</b> Welch's t-test is used for comparison between Treatment and Control groups, "
-                        "which is robust against unequal variances.")
+                        "<b>Statistics:</b> Welch's t-test is used for comparison between Treatment and Control groups.")
         m_text.setWordWrap(True)
         m_layout.addWidget(m_text)
+        m_layout.addStretch()
         tabs.addTab(methodology, "Methodology")
         
-        # Tab 3: Credits
+        # Tab 4: Credits
         credits_tab = QWidget()
         cred_layout = QVBoxLayout(credits_tab)
         
@@ -334,7 +1181,7 @@ class AboutWindow(QDialog):
         
         cred_layout.addLayout(info_layout)
         
-        desc_label = QLabel("Tool for the assisted quantification of qPCR data.")
+        desc_label = QLabel("Tool for the assisted quantification of qPCR data and calculating cDNA synthesis volumes.")
         desc_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         desc_label.setStyleSheet("font-style: italic; color: #7f8c8d;")
         cred_layout.addWidget(desc_label)
@@ -361,6 +1208,10 @@ class CtQuantApp(QMainWindow):
             self.setWindowIcon(QIcon(icon_path))
         
         self.init_ui()
+
+    def set_status_message(self, message):
+        """Update the status label at the bottom of the window."""
+        self.status_label.setText(message)
         
     def init_ui(self):
         central_widget = QWidget()
@@ -379,7 +1230,40 @@ class CtQuantApp(QMainWindow):
         
         top_layout.addStretch()
         
-        # Primary "Load Excel" Button
+        self.about_btn = QPushButton("About CtQuant")
+        self.about_btn.clicked.connect(self.show_about)
+        top_layout.addWidget(self.about_btn)
+        
+        main_layout.addLayout(top_layout)
+        
+        # Main Content: Tabs for "Main View" and "Detailed Results"
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+        
+        # Status Label
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("color: #666; font-style: italic;")
+        main_layout.addWidget(self.status_label)
+        
+        # Tab 1: Plate Mapper/qPCR Analysis (Main View) - Default
+        self.main_view_tab = QWidget()
+        self.setup_main_view_tab()
+        self.tabs.addTab(self.main_view_tab, "Plate Mapper/qPCR Analysis")
+        
+        # Tab 2: cDNA Calculation
+        self.cdna_tab = cDNA_Tab()
+        self.tabs.addTab(self.cdna_tab, "cDNA Calculation")
+        
+        # Tab 3: Detailed Results
+        self.detailed_tab = QWidget()
+        self.setup_detailed_tab()
+        self.tabs.addTab(self.detailed_tab, "Detailed Results")
+
+    def setup_main_view_tab(self):
+        layout = QVBoxLayout(self.main_view_tab)
+        
+        # Load Button Section
+        btn_layout = QHBoxLayout()
         self.load_btn = QPushButton("Load qPCR Excel Data")
         self.load_btn.setMinimumHeight(40)
         self.load_btn.setStyleSheet("""
@@ -396,37 +1280,9 @@ class CtQuantApp(QMainWindow):
             }
         """)
         self.load_btn.clicked.connect(self.load_excel)
-        top_layout.addWidget(self.load_btn)
-        
-        top_layout.addStretch()
-        
-        self.help_btn = QPushButton("?")
-        self.help_btn.setFixedSize(30, 30)
-        self.help_btn.clicked.connect(self.show_general_help)
-        top_layout.addWidget(self.help_btn)
-        
-        self.about_btn = QPushButton("About CtQuant")
-        self.about_btn.clicked.connect(self.show_about)
-        top_layout.addWidget(self.about_btn)
-        
-        main_layout.addLayout(top_layout)
-        
-        # Main Content: Tabs for "Main View" and "Detailed Results"
-        self.tabs = QTabWidget()
-        main_layout.addWidget(self.tabs)
-        
-        # Tab 1: Main View (Mapper + Summary + Main Results)
-        self.main_view_tab = QWidget()
-        self.setup_main_view_tab()
-        self.tabs.addTab(self.main_view_tab, "Main View")
-        
-        # Tab 2: Detailed Results
-        self.detailed_tab = QWidget()
-        self.setup_detailed_tab()
-        self.tabs.addTab(self.detailed_tab, "Detailed Results")
-
-    def setup_main_view_tab(self):
-        layout = QVBoxLayout(self.main_view_tab)
+        btn_layout.addWidget(self.load_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
         
         # Top Section: Mapper and Controls
         top_section = QHBoxLayout()
@@ -444,41 +1300,67 @@ class CtQuantApp(QMainWindow):
         # Right: Controls
         controls_layout = QVBoxLayout()
         
-        mapping_box = QGroupBox("Assign Mapping")
-        mapping_layout = QFormLayout(mapping_box)
+        mapping_box = QGroupBox("Plate Tools")
+        mapping_layout = QVBoxLayout(mapping_box)
+        
+        # Tools: Paint / Erase
+        tools_layout = QHBoxLayout()
+        instruction_label = QLabel("Left-click to Paint, Right-click to Erase")
+        instruction_label.setStyleSheet("font-style: italic; color: #666;")
+        instruction_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tools_layout.addWidget(instruction_label)
+        mapping_layout.addLayout(tools_layout)
+        
+        # Form for Paint Data
+        form_layout = QFormLayout()
         
         self.group_type_combo = QComboBox()
         self.group_type_combo.addItems(["None", "Control", "Treatment"])
         self.group_type_combo.setCurrentText("Control")
-        mapping_layout.addRow("Group:", self.group_type_combo)
+        self.group_type_combo.currentTextChanged.connect(self.update_brush)
+        form_layout.addRow("Group:", self.group_type_combo)
         
         self.sample_name_input = QComboBox()
         self.sample_name_input.setEditable(True)
         self.sample_name_input.lineEdit().returnPressed.connect(
             lambda: self.add_to_combo(self.sample_name_input))
-        mapping_layout.addRow("Sample Name:", self.sample_name_input)
+        self.sample_name_input.currentTextChanged.connect(self.update_brush)
+        form_layout.addRow("Sample Name:", self.sample_name_input)
         
         self.gene_type_combo = QComboBox()
         self.gene_type_combo.addItems(["None", "Housekeeping", "GOI"])
         self.gene_type_combo.setCurrentText("Housekeeping")
-        mapping_layout.addRow("Gene Type:", self.gene_type_combo)
+        self.gene_type_combo.currentTextChanged.connect(self.update_brush)
+        form_layout.addRow("Gene Type:", self.gene_type_combo)
         
         self.gene_name_input = QComboBox()
         self.gene_name_input.setEditable(True)
         self.gene_name_input.lineEdit().returnPressed.connect(
             lambda: self.add_to_combo(self.gene_name_input))
-        mapping_layout.addRow("Gene Name:", self.gene_name_input)
+        self.gene_name_input.currentTextChanged.connect(self.update_brush)
+        form_layout.addRow("Gene Name:", self.gene_name_input)
         
-        self.assign_btn = QPushButton("Assign Selected")
-        self.assign_btn.clicked.connect(self.assign_mapping)
-        mapping_layout.addRow(self.assign_btn)
-        
+        # Clear Plate Button
         self.clear_plate_btn = QPushButton("Clear Plate")
         self.clear_plate_btn.clicked.connect(self.clear_plate)
         self.clear_plate_btn.setStyleSheet("color: #c0392b; font-weight: bold;")
-        mapping_layout.addRow(self.clear_plate_btn)
+        form_layout.addRow("", self.clear_plate_btn)
+
+        mapping_layout.addLayout(form_layout)
+        
+        # Action Buttons
+        actions_layout = QHBoxLayout()
+        self.export_pipetting_btn = QPushButton("Export Scheme")
+        self.export_pipetting_btn.clicked.connect(self.mapper.export_pipetting_scheme)
+        actions_layout.addWidget(self.export_pipetting_btn)
+        
+        # Removed redundant clear button from actions_layout
+        # actions_layout.addWidget(self.clear_plate_btn)
         
         controls_layout.addWidget(mapping_box)
+        
+        # Initialize brush
+        self.update_brush()
 
         # Technical Replicates config
         rep_box = QGroupBox("Technical Replicates")
@@ -609,6 +1491,31 @@ class CtQuantApp(QMainWindow):
         self.results_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.results_tree.customContextMenuRequested.connect(self.show_results_context_menu)
 
+    def update_brush(self):
+        data = {
+            'sample_name': self.sample_name_input.currentText(),
+            'gene_name': self.gene_name_input.currentText(),
+            'group_type': self.group_type_combo.currentText(),
+            'gene_type': self.gene_type_combo.currentText()
+        }
+        self.mapper.set_brush_data(data)
+
+    def transfer_samples_from_cdna(self, groups):
+        """Transfer group names from cDNA tab to Plate Mapper sample list."""
+        count = 0
+        for group in groups:
+            if self.sample_name_input.findText(group) == -1:
+                self.sample_name_input.addItem(group)
+                count += 1
+        
+        if count > 0:
+            QMessageBox.information(self, "Transfer Complete", f"Transferred {count} group names to Plate Mapper sample list.")
+            # Switch to Main View tab
+            self.tabs.setCurrentIndex(0)
+        else:
+            QMessageBox.information(self, "Transfer Complete", "All group names were already present in the list.")
+            self.tabs.setCurrentIndex(0)
+
     def on_plate_format_changed(self):
         fmt = self.plate_format_combo.currentText()
         rows, cols = (16, 24) if fmt == "384-well" else (8, 12)
@@ -618,8 +1525,9 @@ class CtQuantApp(QMainWindow):
         self.mapper = PlateMapper(rows, cols)
         
         # Find scroll area and replace widget
-        scroll = self.mapper_tab.findChild(QScrollArea)
+        scroll = self.main_view_tab.findChild(QScrollArea)
         scroll.setWidget(self.mapper)
+        self.update_brush()
         
     def load_excel(self):
         # Check if analysis has been performed and ask to save
@@ -640,6 +1548,7 @@ class CtQuantApp(QMainWindow):
 
         path, _ = QFileDialog.getOpenFileName(self, "Open qPCR Excel", "", "Excel Files (*.xlsx *.xls)")
         if path:
+            self.set_status_message(f"Loaded: {os.path.basename(path)}")
             # Clear previous results and tables
             if hasattr(self, 'results_df'):
                 delattr(self, 'results_df')
@@ -654,74 +1563,197 @@ class CtQuantApp(QMainWindow):
                 self.mapper.reset_all_wells()
             
             try:
-                # 1. Load data with flexible header detection
-                df_header = pd.read_excel(path, nrows=50)
-                skip = 0
-                well_col = None
-                ct_col = None
-                sample_col = None
-                target_col = None
-                
-                # Look for column headers in the first 50 rows
-                for i, row in df_header.iterrows():
-                    row_vals = [str(v).strip().lower() for v in row.values]
-                    if 'well' in row_vals:
-                        skip = i + 1
-                        # Map columns
-                        row_list = list(row.values)
-                        for idx, val in enumerate(row_list):
-                            v_low = str(val).strip().lower()
-                            if v_low == 'well': well_col = val
-                            if v_low in ['cq', 'ct', 'cp', 'cycle']: ct_col = val
-                            if v_low == 'sample': sample_col = val
-                            if v_low in ['target', 'gene']: target_col = val
-                        break
-                
-                if skip == 0:
-                    # Fallback: assume first row if 'well' not found in first 50
-                    self.raw_df = pd.read_excel(path)
-                else:
-                    self.raw_df = pd.read_excel(path, skiprows=skip)
-                
-                # Normalize column names for internal use
-                self.raw_df.columns = [str(c).strip() for c in self.raw_df.columns]
-                
-                # Final check for required columns
-                if well_col is None:
-                    for col in self.raw_df.columns:
-                        if col.lower() == 'well':
-                            well_col = col
-                            break
-                if ct_col is None:
-                    for col in self.raw_df.columns:
-                        if col.lower() in ['cq', 'ct', 'cp', 'cycle']:
-                            ct_col = col
-                            break
-                
-                if not well_col or not ct_col:
-                    QMessageBox.warning(self, "Format Error", "Could not find 'Well' or 'Cq/Ct' columns.")
+                # Validate Excel file integrity before attempting to read
+                try:
+                    import zipfile
+                    # XLSX files are ZIP files, so check if it's a valid ZIP
+                    if not zipfile.is_zipfile(path):
+                        QMessageBox.critical(self, "Invalid File", 
+                            f"The selected file does not appear to be a valid Excel file.\n\n"
+                            f"Please ensure the file is a proper .xlsx or .xls file and is not corrupted.")
+                        return
+                    
+                    # If it's a ZIP, check if it has the required XLSX structure
+                    with zipfile.ZipFile(path, 'r') as zf:
+                        namelist = zf.namelist()
+                        if '[Content_Types].xml' not in namelist:
+                            QMessageBox.critical(self, "Corrupted File", 
+                                f"The Excel file appears to be corrupted or incomplete.\n\n"
+                                f"It is missing required internal structure ([Content_Types].xml).\n\n"
+                                f"Please try:\n"
+                                f"1. Re-saving the file in Excel\n"
+                                f"2. Creating a fresh export from your qPCR instrument")
+                            return
+                except zipfile.BadZipFile:
+                    QMessageBox.critical(self, "Invalid File", 
+                        f"The selected file is not a valid Excel file or is corrupted.\n\n"
+                        f"Please ensure you selected a proper .xlsx or .xls file.")
                     return
                 
-                self.well_col = well_col
-                self.ct_col = ct_col
+                xls = pd.ExcelFile(path)
+                
+                if not xls.sheet_names:
+                    QMessageBox.warning(self, "Error", "No sheets found in Excel file.")
+                    return
+
+                # If multiple sheets exist, let user choose (or default to single/best)
+                target_sheet_name = None
+                
+                if len(xls.sheet_names) > 1:
+                    # Ask user to select sheet
+                    item, ok = QInputDialog.getItem(self, "Select Data Sheet", 
+                                                  "Multiple sheets found. Please select the sheet containing the Ct/Cq data:", 
+                                                  xls.sheet_names, 0, False)
+                    if ok and item:
+                        target_sheet_name = item
+                    else:
+                        return # User cancelled
+                else:
+                    target_sheet_name = xls.sheet_names[0]
+
+                found_data = False
+                col_map = {} # standard_name -> actual_name
+                
+                # Scan the selected sheet (or all if we were to loop, but we decided to ask user)
+                # If user selected a sheet, we only scan that one.
+                
+                sheets_to_scan = [target_sheet_name] if target_sheet_name else xls.sheet_names
+                
+                for sheet_name in sheets_to_scan:
+                    # Read first 50 rows of the sheet
+                    try:
+                        df_header = pd.read_excel(path, sheet_name=sheet_name, nrows=50, header=None)
+                    except:
+                        continue # Skip empty sheets or read errors
+                        
+                    # Scoring system for header row detection
+                    best_score = 0
+                    best_row_idx = -1
+                    best_map = {}
+                    
+                    for i, row in df_header.iterrows():
+                        row_vals = [str(v).strip() for v in row.values]
+                        row_vals_lower = [v.lower() for v in row_vals]
+                        
+                        current_map = {}
+                        score = 0
+                        
+                        # Check columns
+                        for idx, val in enumerate(row_vals):
+                            v_low = row_vals_lower[idx]
+                            
+                            # Well - Prioritize "Well Position" over "Well" if both exist
+                            if v_low in ['well position', 'well pos', 'pos', 'position']:
+                                current_map['Well'] = val
+                                score += 2
+                            elif v_low == 'well':
+                                if 'Well' not in current_map: # Only take 'well' if we haven't found 'well position' yet
+                                    current_map['Well'] = val
+                                    score += 2
+                                    
+                            # Ct
+                            elif v_low in ['ct', 'cq', 'cp', 'cycle', 'c t']:
+                                current_map['Ct'] = val
+                                score += 2
+                                
+                            # Sample
+                            elif v_low in ['sample', 'sample name', 'sample_name', 'name', 'sample names', 'sample id', 'sampleid']:
+                                current_map['Sample'] = val
+                                score += 1
+                                
+                            # Target
+                            elif v_low in ['target', 'target name', 'target_name', 'gene', 'gene name', 'target names', 'detector']:
+                                current_map['Target'] = val
+                                score += 1
+                                
+                            # Other common qPCR columns (boost confidence)
+                            elif v_low in ['task', 'reporter', 'quencher', 'omit', 'quantity', 'mean', 'sd', 'rq', 'rq min', 'rq max']:
+                                score += 0.5
+
+                        # We need at least Well and Ct to consider it a valid header
+                        if 'Well' in current_map and 'Ct' in current_map:
+                            if score > best_score:
+                                best_score = score
+                                best_row_idx = i
+                                best_map = current_map
+                    
+                    if best_row_idx != -1:
+                        # Found a candidate in this sheet. 
+                        # Is it good enough? 
+                        # If we have Sample and Target too, it's excellent.
+                        # For now, just take the best one found across sheets? 
+                        # Or stop at first "good" one?
+                        # Let's stop at first one that has high confidence (score >= 5?)
+                        # Or just take this one and break.
+                        header_row_idx = best_row_idx
+                        col_map = best_map
+                        self.raw_df = pd.read_excel(path, sheet_name=sheet_name, skiprows=header_row_idx)
+                        
+                        # IMPORTANT: Strip whitespace from column names to match scanner logic
+                        self.raw_df.columns = self.raw_df.columns.astype(str).str.strip()
+                        
+                        found_data = True
+                        break
+                
+                if not found_data:
+                    QMessageBox.warning(self, "Format Error", "Could not find 'Well' and 'Ct/Cq' columns in any sheet.")
+                    return
+                
+                # Normalize columns
+                # Before renaming, we need to handle potential conflicts.
+                # Specifically, if we are mapping "Well Position" -> "Well", but "Well" already exists.
+                # We want to drop the original "Well" column to avoid duplicates.
+                
+                actual_well_col = col_map.get('Well')
+                if actual_well_col and actual_well_col != 'Well':
+                    # We are mapping something else (e.g. "Well Position") to "Well".
+                    # If "Well" exists in the dataframe, drop it to avoid duplicate "Well" columns after rename.
+                    if 'Well' in self.raw_df.columns:
+                        self.raw_df.drop(columns=['Well'], inplace=True, errors='ignore')
+
+                rename_dict = {v: k for k, v in col_map.items()}
+                self.raw_df.rename(columns=rename_dict, inplace=True)
+
+
+                # Fallback: If 'Sample' or 'Target' not found in header scan, check remaining columns
+                if 'Sample' not in self.raw_df.columns:
+                    for c in self.raw_df.columns:
+                        c_str = str(c).lower().strip()
+                        if 'sample' in c_str or 'name' in c_str:
+                            # Avoid renaming 'Target', 'Well', 'Ct' or other critical columns
+                            if c in ['Target', 'Well', 'Ct']: continue
+                            # Also check if it's likely a Target column
+                            if 'target' in c_str or 'gene' in c_str: continue
+                            
+                            self.raw_df.rename(columns={c: 'Sample'}, inplace=True)
+                            break
+                
+                if 'Target' not in self.raw_df.columns:
+                    for c in self.raw_df.columns:
+                        c_str = str(c).lower().strip()
+                        if 'target' in c_str or 'gene' in c_str:
+                             if c in ['Sample', 'Well', 'Ct']: continue
+                             self.raw_df.rename(columns={c: 'Target'}, inplace=True)
+                             break
+                
+                # Clean Data
+                # 1. Handle non-numeric Ct
+                # Coerce to numeric, turning errors (strings like "Undetermined", "N/A") to NaN
+                self.raw_df['Ct'] = pd.to_numeric(self.raw_df['Ct'], errors='coerce')
+                
+                # 2. Drop rows with empty Well
+                self.raw_df.dropna(subset=['Well'], inplace=True)
+                
                 self.raw_data_path = path
                 
                 # 2. Extract Descriptors for Dropdowns
                 samples = []
                 genes = []
                 
-                # Try to find sample/target columns if not found during header scan
-                if sample_col is None:
-                    for col in self.raw_df.columns:
-                        if col.lower() == 'sample': sample_col = col; break
-                if target_col is None:
-                    for col in self.raw_df.columns:
-                        if col.lower() in ['target', 'gene']: target_col = col; break
-                
-                if sample_col in self.raw_df.columns:
-                    samples = sorted(self.raw_df[sample_col].dropna().unique().astype(str))
-                if target_col in self.raw_df.columns:
-                    genes = sorted(self.raw_df[target_col].dropna().unique().astype(str))
+                if 'Sample' in self.raw_df.columns:
+                    samples = sorted(self.raw_df['Sample'].dropna().astype(str).unique())
+                if 'Target' in self.raw_df.columns:
+                    genes = sorted(self.raw_df['Target'].dropna().astype(str).unique())
                 
                 # Update dropdowns
                 self.sample_name_input.clear()
@@ -730,26 +1762,74 @@ class CtQuantApp(QMainWindow):
                 self.gene_name_input.addItems(genes)
                 
                 # 3. Auto-populate Wells
-                for _, row in self.raw_df.iterrows():
-                    well_str = str(row[well_col]).strip()
-                    if not well_str or len(well_str) < 2: continue
+                count_mapped = 0
+                
+                # Check if we have duplicate wells? 
+                # If the file has replicates as separate rows (e.g. A1, A1, A1), we might overwrite.
+                # But qPCR export usually has one row per well per target?
+                # Or one row per well?
+                # If one row per well per target, we might have multiple rows for A1 (Target 1, Target 2).
+                # PlateMapper logic: One well has one Sample and one Gene?
+                # CtQuant seems designed for singleplex or handling replicates by well assignment.
+                # If a well has multiple targets, the current data model (Well object) only holds one 'gene_name'.
+                # So we can't support multiplexing in the same well with this app structure easily.
+                # We will just overwrite, which is consistent with legacy behavior.
+                
+                for idx, row in self.raw_df.iterrows():
+                    well_str = str(row['Well']).strip()
+                    if not well_str or len(well_str) < 1: continue
                     
                     # Convert A01 or A1 to (row, col)
-                    r_char = well_str[0].upper()
-                    r = ord(r_char) - 65
-                    try:
-                        c_part = "".join(filter(str.isdigit, well_str[1:]))
-                        c = int(c_part) - 1
-                        if (r, c) in self.mapper.wells:
-                            well = self.mapper.wells[(r, c)]
-                            well.ct_value = row[ct_col]
-                            if sample_col and sample_col in row:
-                                well.sample_name = str(row[sample_col])
-                            if target_col and target_col in row:
-                                well.gene_name = str(row[target_col])
-                            well.update()
-                    except (ValueError, IndexError):
-                        continue
+                    # Handle both formats.
+                    # Also handle if well is just a number (though we try to avoid mapping that column).
+                    
+                    r = -1
+                    c = -1
+                    
+                    # Try A1/A01 format
+                    if well_str[0].isalpha():
+                        r_char = well_str[0].upper()
+                        r = ord(r_char) - 65
+                        try:
+                            c_part = "".join(filter(str.isdigit, well_str[1:]))
+                            if not c_part: continue
+                            c = int(c_part) - 1
+                        except:
+                            continue
+                    else:
+                        # Maybe it's a number 1..96 (or 1..384)?
+                        # If we failed to get 'Well Position' and fell back to 'Well' (numeric).
+                        # We can convert 1..96 to A1..H12 layout based on current plate dimensions
+                        try:
+                            w_idx = int(float(well_str)) - 1
+                            cols_cnt = self.mapper.cols # 12 or 24
+                            r = w_idx // cols_cnt
+                            c = w_idx % cols_cnt
+                        except:
+                            continue
+                    
+                    if (r, c) in self.mapper.wells:
+                        well = self.mapper.wells[(r, c)]
+                        well.ct_value = row['Ct']
+                        
+                        # Only update sample/gene if they are present and not empty
+                        if 'Sample' in row and pd.notna(row['Sample']):
+                            s_val = str(row['Sample']).strip()
+                            if s_val and s_val.lower() not in ['nan', 'none', '']:
+                                well.sample_name = s_val
+                        
+                        if 'Target' in row and pd.notna(row['Target']):
+                            t_val = str(row['Target']).strip()
+                            if t_val and t_val.lower() not in ['nan', 'none', '']:
+                                well.gene_name = t_val
+                                
+                        well.update()
+                        count_mapped += 1
+                
+                status_msg = f"Loaded: {os.path.basename(path)} (Mapped {count_mapped} wells)"
+                if 'Sample' not in self.raw_df.columns:
+                    status_msg += " [Warning: No Sample Name column found]"
+                self.set_status_message(status_msg)
                 
                 # 4. Post-Load Configuration Dialog
                 self.show_post_load_dialog(samples, genes)
@@ -815,22 +1895,6 @@ class CtQuantApp(QMainWindow):
             combo.setCurrentText(text)
             QMessageBox.information(self, "Entry Added", f"'{text}' has been added to the dropdown list.")
 
-    def assign_mapping(self):
-        g_type = self.group_type_combo.currentText()
-        s_name = self.sample_name_input.currentText()
-        gene_type = self.gene_type_combo.currentText()
-        gene_name = self.gene_name_input.currentText()
-        
-        # Only update fields that are not empty/None if we want to allow partial updates
-        # But let's keep it simple for now.
-        self.mapper.assign_mapping(s_name, gene_name, g_type, gene_type)
-        
-        # Update combo box suggestions
-        if s_name and self.sample_name_input.findText(s_name) == -1:
-            self.sample_name_input.addItem(s_name)
-        if gene_name and self.gene_name_input.findText(gene_name) == -1:
-            self.gene_name_input.addItem(gene_name)
-
     def clear_plate(self):
         # Custom dialog with checkbox
         dialog = QDialog(self)
@@ -873,9 +1937,10 @@ class CtQuantApp(QMainWindow):
                     well.gene_type = "None"
                     well.ct_value = None
                     well.is_excluded = False
+                    well.custom_color = None
                     well.update()
             
-            self.mapper.selection_changed.emit()
+            self.mapper.data_changed.emit()
             
             # Clear internal data references
             if hasattr(self, 'raw_df'): del self.raw_df
@@ -883,6 +1948,11 @@ class CtQuantApp(QMainWindow):
             if hasattr(self, 'results_df'): del self.results_df
             self.results_tree.clear()
             self.overview_table.setRowCount(0)
+            
+            # Clear input fields in Plate Tools
+            self.sample_name_input.clear()
+            self.gene_name_input.clear()
+            self.update_brush()
             
             QMessageBox.information(self, "Success", "Plate cleared" + (" (HK retained)" if retain_hk else "") + ".")
 
@@ -907,7 +1977,8 @@ class CtQuantApp(QMainWindow):
                 continue
                 
             well = self.mapper.wells[pos]
-            if not (well.sample_name and well.gene_name and well.ct_value is not None):
+            # Must have Sample, Gene, and a valid (non-NaN) Ct value
+            if not (well.sample_name and well.gene_name and well.ct_value is not None and not pd.isna(well.ct_value)):
                 continue
 
             # Identify technical replicates based on layout
@@ -1332,5 +2403,5 @@ class CtQuantApp(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = CtQuantApp()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
